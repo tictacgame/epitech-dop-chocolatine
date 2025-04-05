@@ -1,0 +1,189 @@
+name: Chocolatine
+
+on:
+  push:
+    branches-ignore: "ga-ignore"
+  pull_request:
+    branches-ignore: "ga-ignore"
+
+env:
+  MIRROR_URL: ${{ vars.MIRROR_URL }}
+  EXECUTABLES: ${{ vars.EXECUTABLES }}
+
+jobs:
+  check_coding_style:
+    name: Coding Style Checking
+    runs-on: ubuntu-latest
+    container: ghcr.io/epitech/coding-style-checker:latest
+
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v4
+
+      - name: Process coding style
+        shell: bash
+        # It's funny, it's not coding style
+        run: |
+          check.sh $(pwd) $(pwd)
+          should_exit=0
+          if [ -s "$(pwd)/coding-style-reports.log" ]; then
+            while IFS= read -r ERROR
+              do
+                array=(`echo $ERROR | sed 's/:/\n/g'`)
+
+                if [ "${array[2]}" != "INFO" ]; then
+                  should_exit=1
+                  echo "::error title=${array[2]},file=${array[0]#./},line=${array[1]}::${array[3]}"
+                else
+                  echo "::warning title=${array[2]},file=${array[0]#./},line=${array[1]}::${array[3]}"
+                fi
+            done < "$(pwd)/coding-style-reports.log"
+            if [ "$should_exit" == 1 ]; then
+              exit 1
+            fi
+          else
+            echo "::notice ::No coding style errors detected ! Great Job"
+          fi
+
+  check_program_compilation:
+    name: Compilation checker
+    needs: check_coding_style
+    runs-on: ubuntu-latest
+    container: epitechcontent/epitest-docker
+
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v4
+
+      - name: Check make "all" rule
+        timeout-minutes: 2
+        run: make
+
+      - name: Try to clean
+        run: make clean
+
+      - name: Check if the binary stays here
+        run: |
+          should_exit=0
+
+          for FILE in $EXECUTABLES; do
+            if [ -s "$FILE" ]; then
+              if [[ -f "$FILE" && -x "$FILE" ]]; then
+                echo "::notice $FILE has been found and is executable"
+              else
+                echo "::error $FILE has been found but is not executable"
+                should_exit=1
+              fi
+            else
+              echo "::error title=Executable not found,file=${FILE}::Please ensure your file has been compiled"
+              echo $(ls)
+              should_exit=1
+            fi
+          done
+          if [ "$should_exit" == 1 ]; then
+            exit 1
+          fi
+
+  run_tests:
+    name: Run criterion test
+    needs: check_program_compilation
+    runs-on: ubuntu-latest
+    container: epitechcontent/epitest-docker
+
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v4
+
+      - name: Run make test
+        timeout-minutes: 2
+        run: make tests_run
+
+  check_banned_function:
+    name: Check for banned functions
+    needs: run_tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt update && sudo apt install -y cmake make gcc clang
+
+      - name: Create binary
+        run: make
+
+      - name: Check for banned functions
+        shell: bash
+        run: |
+          if [ -f allowed_function.note ]; then
+            allowed_functions=$(cat allowed_function.note)
+          else
+            allowed_functions=""
+            echo "::warning ::Warning: allowed_function.note not found."
+          fi
+          echo $(ls)
+          should_exit=0
+          banned_functions=$(nm -u ${{ env.EXECUTABLES }} | grep GLIBC | grep -v "__" || true)
+          if [ -n "$banned_functions" ]; then
+              IFS=$'\n'
+              for function in ${banned_functions}
+                do
+                  function_name=$(echo "$function" | sed -E 's/^[[:space:]]*[^[:space:]]+[[:space:]]+([a-zA-Z0-9_]+)(@.*)?$/\1/')
+                  if [ -n "$allowed_functions" ]; then
+                      if [[ ! $(echo "$allowed_functions" | grep -F "$function_name") ]]; then
+                          should_exit=1
+                          echo "::error file=./binary::Banned function detected: $function_name"
+                      fi
+                  else
+                      echo "::error file=./binary::Banned function detected: $function_name"
+                      should_exit=1
+                  fi
+              done
+              if [ "$should_exit" == 1 ]; then
+                exit 1
+              else
+                echo "::notice ::No banned functions found."
+              fi
+          else
+            echo "::notice ::No banned functions found."
+          fi
+
+
+  push_to_mirror:
+    name: Push to a mirror repository
+    if: ${{ github.event_name == 'push' }}
+    needs: check_banned_function
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ env.SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -t rsa $(echo ${{ env.MIRROR_URL }} | cut -d':' -f1 | cut -d'@' -f2) >> ~/.ssh/known_hosts
+        env:
+          SSH_KEY: ${{ secrets.GIT_SSH_PRIVATE_KEY }}
+
+      - name: Remove .github directory
+        run: |
+          git filter-branch --force --index-filter 'git rm -r --cached --ignore-unmatch .github' --prune-empty --tag-name-filter cat -- --all
+          git gc --prune=now
+          git clean -fd
+
+      - name: Verify Repository
+        run: |
+          git fsck --full || echo "Git fsck completed with warnings"
+          git gc || echo "Git gc completed with warnings"
+
+      - name: Push to mirror
+        run: |
+          git remote add -f mirror ${{ env.MIRROR_URL }}
+          git push mirror --mirror --prune --force
+          echo "Successfully mirrored to ${{ env.MIRROR_URL }} "
